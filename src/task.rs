@@ -30,6 +30,6 @@ impl<Output> TaskInterface<Output> {
 
 /// To use a task forge you should implement this trait to your tasks.
 pub trait TaskTrait<Arg, Message, Output> {
-    /// The begin method takes in parameter an arg of any type that you can pass to your task, a receiver able to receiv some message from the pool, and the task interface
+    /// The begin method takes in parameter an arg of any type that you can pass to your task, a receiver able to receive some message from the pool, and the task interface
     fn begin(arg: Arg, message_receiver: Receiver<Message>, interface: TaskInterface<Output>);
 }
