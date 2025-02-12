@@ -10,6 +10,8 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::{select, sync::RwLock, time::Duration};
 use tracing::error;
 
+pub(crate) const CHANNEL_SIZE: usize = 100;
+
 type Wrapped<T> = Arc<RwLock<T>>;
 type Result<T> = std::result::Result<T, ForgeError>;
 
@@ -43,7 +45,7 @@ struct WrappedTaskForge<Message: Send, Output: Send> {
 
 impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Message, Output> {
     fn new(error_sender: Sender<ForgeError>) -> Wrapped<Self> {
-        let (end_task_sender, receiver) = channel(100);
+        let (end_task_sender, receiver) = channel(CHANNEL_SIZE);
         let forge = Arc::new(RwLock::new(WrappedTaskForge {
             forge: HashMap::new(),
             end_task_sender,
@@ -136,7 +138,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
         });
     }
 
-    async fn new_task<Task: TaskTrait<TaskArg, Message, Output>, TaskArg>(
+    async fn new_task<Task: TaskTrait<TaskArg, Message, Output>, TaskArg: Send + 'static>(
         &mut self,
         id: OpId,
         arg: TaskArg,
@@ -152,14 +154,12 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
                 };
             }
         }
-        let sender = Task::begin(
-            arg,
-            TaskInterface {
-                id,
-                output_sender: self.end_task_sender.clone(),
-            },
-        );
-        self.forge.insert(id, sender);
+        let (message_sender, message_receiver) = channel(CHANNEL_SIZE);
+        let output_sender = self.end_task_sender.clone();
+        tokio::spawn(async move {
+            Task::begin(arg, message_receiver, TaskInterface { id, output_sender });
+        });
+        self.forge.insert(id, message_sender);
         result
     }
 
@@ -197,13 +197,13 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
     }
 
     fn new_result_redirection(&mut self) -> OutputReceiver<Output> {
-        let (sender, receiver) = channel(100);
+        let (sender, receiver) = channel(CHANNEL_SIZE);
         self.output_result_senders.push(sender);
         receiver
     }
 
     fn new_task_notif_receiver(&mut self, id: OpId) -> Receiver<()> {
-        let (sender, receiver) = channel(100);
+        let (sender, receiver) = channel(CHANNEL_SIZE);
         match self.task_creation_senders.get_mut(&id) {
             Some(senders) => senders.push(sender),
             None => {
@@ -231,7 +231,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
         } else {
             match timer {
                 Some(dur) => {
-                    let (timer_sender, mut timer_receiver) = channel(100);
+                    let (timer_sender, mut timer_receiver) = channel(CHANNEL_SIZE);
                     self.cleaning_notifier = Some((timer_sender, awaited));
                     tokio::spawn(async move {
                         let sleep = tokio::time::sleep(dur);
@@ -287,7 +287,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> Default
     for TaskForge<Message, Output>
 {
     fn default() -> Self {
-        let (sender, receiver) = channel(100);
+        let (sender, receiver) = channel(CHANNEL_SIZE);
         panic_error_handler(receiver);
         Self {
             forge: WrappedTaskForge::new(sender),
@@ -307,7 +307,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> TaskForge<Message, 
     /// This function creates a forge and return it along with a receiver to handle errors in result reception.
     /// Note that the forge implements Default, the default implemenation uses panic_error_handler to handle errors
     pub fn new() -> (Self, ErrorReceiver) {
-        let (sender, receiver) = channel(100);
+        let (sender, receiver) = channel(CHANNEL_SIZE);
         (
             Self {
                 forge: WrappedTaskForge::new(sender),
@@ -320,7 +320,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> TaskForge<Message, 
     /// This function may fail if the task is already running, but not if the task was previously running and is now closed.
     /// If a `task_creation_waiter` is waiting for the task ID, a notification is sent.
     /// Returns an error if one of the senders is invalid.
-    pub async fn new_task<Task: TaskTrait<TaskArg, Message, Output>, TaskArg>(
+    pub async fn new_task<Task: TaskTrait<TaskArg, Message, Output>, TaskArg: Send + 'static>(
         &self,
         id: OpId,
         config: TaskArg,
@@ -372,168 +372,178 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> TaskForge<Message, 
     }
 }
 
-#[tokio::test]
-async fn test_simple_task_execution() {
-    let (task_forge, _) = TaskForge::<String, String>::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    struct EchoTask;
+    type Message = String;
+    type Output = String;
+    type Arg = String;
 
-    impl TaskTrait<String, String, String> for EchoTask {
-        fn begin(_: String, task_interface: TaskInterface<String>) -> Sender<String> {
-            let (sender, mut receiver) = channel(1);
-            tokio::spawn(async move {
-                while let Some(input) = receiver.recv().await {
-                    task_interface
-                        .output(format!("Echo: {input}"))
-                        .await
-                        .unwrap();
-                }
-            });
-            sender
+    #[tokio::test]
+    async fn test_simple_task_execution() {
+        let (task_forge, _) = TaskForge::<Message, Output>::new();
+
+        struct EchoTask;
+
+        impl TaskTrait<Arg, Message, Output> for EchoTask {
+            fn begin(
+                _: String,
+                mut message_receiver: Receiver<String>,
+                task_interface: TaskInterface<Output>,
+            ) {
+                tokio::spawn(async move {
+                    if let Some(input) = message_receiver.recv().await {
+                        task_interface
+                            .output(format!("Echo: {input}"))
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
         }
-    }
 
-    let task_id = 1;
-    task_forge
-        .new_task::<EchoTask, _>(task_id, "Hello".to_string())
-        .await
-        .unwrap();
-    task_forge
-        .send(task_id, "Hello again!".to_string())
-        .await
-        .unwrap();
+        let task_id = 1;
+        task_forge
+            .new_task::<EchoTask, _>(task_id, "Hello".to_string())
+            .await
+            .unwrap();
+        task_forge
+            .send(task_id, "Hello again!".to_string())
+            .await
+            .unwrap();
 
-    let mut result_receiver = task_forge.new_result_redirection().await;
-    let result = result_receiver.recv().await.unwrap();
-    assert_eq!(result.output.as_ref(), "Echo: Hello again!");
-}
-
-#[tokio::test]
-async fn test_task_does_not_exist() {
-    let (task_forge, _) = TaskForge::<String, String>::new();
-    let task_id = 999;
-    let result = task_forge.send(task_id, "Invalid task".to_string()).await;
-
-    assert!(matches!(result, Err(ForgeError::TaskNotExist(_))));
-}
-
-#[tokio::test]
-async fn test_forge_cleaning() {
-    let (task_forge, _) = TaskForge::<String, String>::new();
-
-    struct DummyTask;
-    impl TaskTrait<(), String, String> for DummyTask {
-        fn begin(_: (), task_interface: TaskInterface<String>) -> Sender<String> {
-            let (sender, _) = channel(1);
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                let _ = task_interface.output("Completed".to_string()).await;
-            });
-            sender
-        }
-    }
-
-    let none_cleaner = task_forge.clean(None, None).await;
-    assert!(none_cleaner.is_none());
-
-    let awaited = 200;
-    for i in 0..awaited {
-        task_forge.new_task::<DummyTask, _>(i, ()).await.unwrap();
-    }
-
-    let cleaner = task_forge.clean(Some(awaited as usize), None).await;
-    assert!(cleaner.is_some());
-    cleaner.unwrap().recv().await;
-
-    let none_cleaner = task_forge.clean(None, None).await;
-    assert!(none_cleaner.is_none());
-}
-
-#[tokio::test]
-async fn test_forge_cleaning_timeout() {
-    let (task_forge, _) = TaskForge::<String, String>::new();
-
-    struct InfTask;
-    impl TaskTrait<(), String, String> for InfTask {
-        fn begin(_: (), _: TaskInterface<String>) -> Sender<String> {
-            let (sender, _) = channel(1);
-            sender
-        }
-    }
-
-    task_forge.new_task::<InfTask, _>(0, ()).await.unwrap();
-
-    let cleaner = task_forge
-        .clean(None, Some(Duration::from_millis(200)))
-        .await;
-    assert!(cleaner.is_some());
-    assert!(matches!(
-        cleaner.unwrap().recv().await,
-        Some(Err(ForgeError::CleaningTimeOut(1)))
-    ))
-}
-
-#[tokio::test]
-async fn test_send_concurrent_tasks() {
-    let (task_forge, _) = TaskForge::<u64, u64>::new();
-
-    struct IncrementTask;
-    impl TaskTrait<u64, u64, u64> for IncrementTask {
-        fn begin(init_val: u64, task_interface: TaskInterface<u64>) -> Sender<u64> {
-            let (sender, mut receiver) = channel(1);
-            tokio::spawn(async move {
-                while let Some(val) = receiver.recv().await {
-                    task_interface.output(init_val + val).await.unwrap();
-                }
-            });
-            sender
-        }
-    }
-
-    for i in 0..5 {
-        task_forge.new_task::<IncrementTask, _>(i, i).await.unwrap();
-        task_forge.send(i, 10).await.unwrap();
-    }
-
-    let mut result_receiver = task_forge.new_result_redirection().await;
-    for _ in 0..5 {
+        let mut result_receiver = task_forge.new_result_redirection().await;
         let result = result_receiver.recv().await.unwrap();
-        assert_eq!(result.output.as_ref(), &(result.id + 10));
+        assert_eq!(result.output.as_ref(), "Echo: Hello again!");
     }
-}
 
-#[tokio::test]
-async fn test_wait_and_send_concurrent_tasks() {
-    let (task_forge, _) = TaskForge::<u64, u64>::new();
+    #[tokio::test]
+    async fn test_task_does_not_exist() {
+        let (task_forge, _) = TaskForge::<String, String>::new();
+        let task_id = 999;
+        let result = task_forge.send(task_id, "Invalid task".to_string()).await;
 
-    struct IncrementTask;
-    impl TaskTrait<u64, u64, u64> for IncrementTask {
-        fn begin(init_val: u64, task_interface: TaskInterface<u64>) -> Sender<u64> {
-            let (sender, mut receiver) = channel(1);
-            tokio::spawn(async move {
-                while let Some(val) = receiver.recv().await {
-                    task_interface.output(init_val + val).await.unwrap();
-                }
-            });
-            sender
+        assert!(matches!(result, Err(ForgeError::TaskNotExist(_))));
+    }
+
+    #[tokio::test]
+    async fn test_forge_cleaning() {
+        let (task_forge, _) = TaskForge::<String, String>::new();
+
+        struct DummyTask;
+        impl TaskTrait<(), String, String> for DummyTask {
+            fn begin(_: (), _: Receiver<Message>, task_interface: TaskInterface<Output>) {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = task_interface.output("Completed".to_string()).await;
+                });
+            }
+        }
+
+        let none_cleaner = task_forge.clean(None, None).await;
+        assert!(none_cleaner.is_none());
+
+        let awaited = 200;
+        for i in 0..awaited {
+            task_forge.new_task::<DummyTask, _>(i, ()).await.unwrap();
+        }
+
+        let cleaner = task_forge.clean(Some(awaited as usize), None).await;
+        assert!(cleaner.is_some());
+        cleaner.unwrap().recv().await;
+
+        let none_cleaner = task_forge.clean(None, None).await;
+        assert!(none_cleaner.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forge_cleaning_timeout() {
+        let (task_forge, _) = TaskForge::<String, String>::new();
+
+        struct InfTask;
+        impl TaskTrait<(), String, String> for InfTask {
+            fn begin(_: (), _: Receiver<Message>, _: TaskInterface<String>) {}
+        }
+
+        task_forge.new_task::<InfTask, _>(0, ()).await.unwrap();
+
+        let cleaner = task_forge
+            .clean(None, Some(Duration::from_millis(200)))
+            .await;
+        assert!(cleaner.is_some());
+        assert!(matches!(
+            cleaner.unwrap().recv().await,
+            Some(Err(ForgeError::CleaningTimeOut(1)))
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_send_concurrent_tasks() {
+        let (task_forge, _) = TaskForge::<u64, u64>::new();
+
+        struct IncrementTask;
+        impl TaskTrait<u64, u64, u64> for IncrementTask {
+            fn begin(
+                init_val: u64,
+                mut message_receiver: Receiver<u64>,
+                task_interface: TaskInterface<u64>,
+            ) {
+                tokio::spawn(async move {
+                    if let Some(val) = message_receiver.recv().await {
+                        task_interface.output(init_val + val).await.unwrap();
+                    }
+                });
+            }
+        }
+
+        for i in 0..5 {
+            task_forge.new_task::<IncrementTask, _>(i, i).await.unwrap();
+            task_forge.send(i, 10).await.unwrap();
+        }
+
+        let mut result_receiver = task_forge.new_result_redirection().await;
+        for _ in 0..5 {
+            let result = result_receiver.recv().await.unwrap();
+            assert_eq!(result.output.as_ref(), &(result.id + 10));
         }
     }
 
-    for i in 0..5 {
-        let task_forge = task_forge.clone();
-        tokio::spawn(async move { task_forge.wait_and_send(i, 10).await.unwrap() });
-    }
+    #[tokio::test]
+    async fn test_wait_and_send_concurrent_tasks() {
+        let (task_forge, _) = TaskForge::<u64, u64>::new();
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        struct IncrementTask;
+        impl TaskTrait<u64, u64, u64> for IncrementTask {
+            fn begin(
+                init_val: u64,
+                mut message_receiver: Receiver<u64>,
+                task_interface: TaskInterface<u64>,
+            ) {
+                tokio::spawn(async move {
+                    if let Some(val) = message_receiver.recv().await {
+                        task_interface.output(init_val + val).await.unwrap();
+                    }
+                });
+            }
+        }
 
-    for i in 0..5 {
-        task_forge.new_task::<IncrementTask, _>(i, i).await.unwrap();
-    }
+        for i in 0..5 {
+            let task_forge = task_forge.clone();
+            tokio::spawn(async move { task_forge.wait_and_send(i, 10).await.unwrap() });
+        }
 
-    let mut result_receiver = task_forge.new_result_redirection().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    for _ in 0..5 {
-        let result = result_receiver.recv().await.unwrap();
-        assert_eq!(result.output.as_ref(), &(result.id + 10));
+        for i in 0..5 {
+            task_forge.new_task::<IncrementTask, _>(i, i).await.unwrap();
+        }
+
+        let mut result_receiver = task_forge.new_result_redirection().await;
+
+        for _ in 0..5 {
+            let result = result_receiver.recv().await.unwrap();
+            assert_eq!(result.output.as_ref(), &(result.id + 10));
+        }
     }
 }

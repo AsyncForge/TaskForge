@@ -24,6 +24,7 @@ A flexible and asynchronous task forge for concurrent task execution in Rust. `T
 - Automatically notify when tasks complete or when the forge is cleaned.
 - Flexible task creation with support for generic task arguments.
 - Customizable error handling using different error handlers.
+- Wait for all tasks to end with an optional timeout.
 
 ---
 
@@ -37,29 +38,31 @@ tokio = { version = "1", features = ["full"] }
 
 ---
 
-## **Features**
+## **Examples**
 
 # Basic Example
 
 Below is a simple example using the `TaskForge` to create and run a basic task:
 
 ```rust
-use task_forge::{task::TaskInterface, Sender, channel, TaskForge, TaskTrait};
+use task_forge::{task::TaskTrait, Sender, Receiver, channel, TaskForge, task::TaskInterface};
 
 struct EchoTask;
 
 impl TaskTrait<String, String, String> for EchoTask {
-    fn begin(_: String, task_interface: TaskInterface<String>) -> Sender<String> {
-        let (sender, mut receiver) = channel(1);
+    fn begin(
+        _: String,
+        mut message_receiver: Receiver<String>,
+        task_interface: TaskInterface<Output>,
+    ) {
         tokio::spawn(async move {
-            while let Some(input) = receiver.recv().await {
+            if let Some(input) = message_receiver.recv().await {
                 task_interface
                     .output(format!("Echo: {input}"))
                     .await
                     .unwrap();
             }
         });
-        sender
     }
 }
 
@@ -68,7 +71,7 @@ async fn main() {
     let (task_forge, _) = TaskForge::<String, String>::new();
 
     let task_id = 1;
-    task_forgenew_task::<EchoTask, _>(task_id, "Hello".to_string()).await.unwrap();
+    task_forge.new_task::<EchoTask, _>(task_id, "Hello".to_string()).await.unwrap();
     task_forge.send(task_id, "Hello again!".to_string()).await.unwrap();
 
     let mut result_receiver = task_forge.new_result_redirection().await;
@@ -100,18 +103,20 @@ tokio::spawn(async move {
 You can spawn and manage multiple tasks concurrently:
 ```rust
 struct IncrementTask;
-
 impl TaskTrait<u64, u64, u64> for IncrementTask {
-    fn begin(init_val: u64, task_interface: TaskInterface<u64>) -> Sender<u64> {
-        let (sender, mut receiver) = channel(1);
+    fn begin(
+        init_val: u64,
+        mut message_receiver: Receiver<u64>,
+        task_interface: TaskInterface<u64>,
+    ) {
         tokio::spawn(async move {
-            while let Some(val) = receiver.recv().await {
+            if let Some(val) = message_receiver.recv().await {
                 task_interface.output(init_val + val).await.unwrap();
             }
         });
-        sender
     }
 }
+
 
 for i in 0..5 {
     task_forge.new_task::<IncrementTask, _>(i, i).await.unwrap();
@@ -137,10 +142,6 @@ log_error_handler(error_receiver);
 ```
 You can also create your own error handler by using the error receiver.
 
-## **Documentation**
-
-For more details on API usage, visit the docs.rs page
-
 ## **Licence**
 
-This project is licensed under the MIT License. Let me know if you’d like any changes or additions!
+This project is licensed under the MIT Licence. Let me know if you’d like any changes or additions!
