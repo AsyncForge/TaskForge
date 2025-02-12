@@ -34,6 +34,9 @@ pub enum ForgeError {
 
     #[error("Task {0} failed to give its output to the forge")]
     FailedToOutput(OpId),
+
+    #[error("The cleaning phase has time out, remaining process: {0}")]
+    CleaningTimeOut(usize),
 }
 
 pub type ErrorReceiver = Receiver<ForgeError>;

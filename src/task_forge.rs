@@ -7,10 +7,11 @@ use crate::{
 };
 use std::marker::Send;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::{select, sync::RwLock, time::Duration};
 use tracing::error;
 
 type Wrapped<T> = Arc<RwLock<T>>;
+type Result<T> = std::result::Result<T, ForgeError>;
 
 pub type OpId = u64;
 
@@ -37,7 +38,7 @@ struct WrappedTaskForge<Message: Send, Output: Send> {
     output_result_senders: Vec<OutputSender<Output>>,
     task_creation_senders: HashMap<OpId, Vec<Sender<()>>>,
     task_states: HashMap<OpId, TaskState>,
-    cleaning_notifier: Option<(Sender<()>, Option<usize>)>,
+    cleaning_notifier: Option<(Sender<Result<()>>, Option<usize>)>,
 }
 
 impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Message, Output> {
@@ -82,7 +83,7 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
             self.task_states.clear();
             self.task_creation_senders.clear();
             let notifier = self.cleaning_notifier.take().unwrap().0; // Can't fail
-            if notifier.send(()).await.is_err() {
+            if notifier.send(Ok(())).await.is_err() {
                 return Err(ForgeError::CleaningNotifierError);
             }
         }
@@ -216,14 +217,50 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> WrappedTaskForge<Me
         self.forge.is_empty()
     }
 
-    async fn clean(&mut self, awaited: Option<usize>) -> Option<Receiver<()>> {
-        let (sender, receiver) = channel(100);
+    fn clean(
+        &mut self,
+        wrapped_self: Wrapped<Self>,
+        awaited: Option<usize>,
+        timer: Option<Duration>,
+    ) -> Option<Receiver<Result<()>>> {
+        let (sender, receiver) = channel::<Result<()>>(100);
         if self.forge.is_empty() {
             self.task_creation_senders.clear();
             self.task_states.clear();
             None
         } else {
-            self.cleaning_notifier = Some((sender, awaited));
+            match timer {
+                Some(dur) => {
+                    let (timer_sender, mut timer_receiver) = channel(100);
+                    self.cleaning_notifier = Some((timer_sender, awaited));
+                    tokio::spawn(async move {
+                        let sleep = tokio::time::sleep(dur);
+                        tokio::pin!(sleep);
+                        let timer = timer_receiver.recv();
+                        tokio::pin!(timer);
+                        select!(
+                            res = &mut timer => {
+                                sender.send(res.unwrap()).await.unwrap();
+                            },
+                            _ = &mut sleep => {
+                                let remain = {
+                                    let mut forge = wrapped_self.write().await;
+                                    let remain = forge.forge.len();
+                                    forge.forge.clear();
+                                    forge.task_states.clear();
+                                    forge.task_creation_senders.clear();
+                                    forge.cleaning_notifier = None;
+                                    remain
+                                };
+                                sender.send(Err(ForgeError::CleaningTimeOut(remain))).await.unwrap();
+                            }
+                        );
+                    });
+                }
+                None => {
+                    self.cleaning_notifier = Some((sender, awaited));
+                }
+            }
             Some(receiver)
         }
     }
@@ -321,9 +358,17 @@ impl<Message: Send + 'static, Output: Send + 'static + Sync> TaskForge<Message, 
         self.forge.read().await.send(id, msg).await
     }
 
-    /// This function put the forge in cleaning phase, the awaited parameter represents the number of process that have to be awaited, if None we simply wait for the forge to be empty. If the forge is already cleaned, then the function returns None directly, otherwise, the function bring the forge in cleaning phase and returns a receiver that will notify when the forge is cleaned
-    pub async fn clean(&self, awaited: Option<usize>) -> Option<Receiver<()>> {
-        self.forge.write().await.clean(awaited).await
+    /// This function put the forge in cleaning phase.
+    /// The awaited parameter represents the number of process that have to be awaited, if None we simply wait for the forge to be empty.
+    /// The timer parameter represents the time that we have to wait before throwing an error through the output sender. If None, the pool will wait infinitely.
+    /// If the forge is already cleaned, then the function returns None directly, otherwise, the function bring the forge in cleaning phase and returns a receiver that will notify when the forge is cleaned
+    pub async fn clean(
+        &self,
+        awaited: Option<usize>,
+        timer: Option<Duration>,
+    ) -> Option<Receiver<Result<()>>> {
+        let w = self.forge.clone();
+        self.forge.write().await.clean(w, awaited, timer)
     }
 }
 
@@ -388,7 +433,7 @@ async fn test_forge_cleaning() {
         }
     }
 
-    let none_cleaner = task_forge.clean(None).await;
+    let none_cleaner = task_forge.clean(None, None).await;
     assert!(none_cleaner.is_none());
 
     let awaited = 200;
@@ -396,12 +441,36 @@ async fn test_forge_cleaning() {
         task_forge.new_task::<DummyTask, _>(i, ()).await.unwrap();
     }
 
-    let cleaner = task_forge.clean(Some(awaited as usize)).await;
+    let cleaner = task_forge.clean(Some(awaited as usize), None).await;
     assert!(cleaner.is_some());
     cleaner.unwrap().recv().await;
 
-    let none_cleaner = task_forge.clean(None).await;
+    let none_cleaner = task_forge.clean(None, None).await;
     assert!(none_cleaner.is_none());
+}
+
+#[tokio::test]
+async fn test_forge_cleaning_timeout() {
+    let (task_forge, _) = TaskForge::<String, String>::new();
+
+    struct InfTask;
+    impl TaskTrait<(), String, String> for InfTask {
+        fn begin(_: (), _: TaskInterface<String>) -> Sender<String> {
+            let (sender, _) = channel(1);
+            sender
+        }
+    }
+
+    task_forge.new_task::<InfTask, _>(0, ()).await.unwrap();
+
+    let cleaner = task_forge
+        .clean(None, Some(Duration::from_millis(200)))
+        .await;
+    assert!(cleaner.is_some());
+    assert!(matches!(
+        cleaner.unwrap().recv().await,
+        Some(Err(ForgeError::CleaningTimeOut(1)))
+    ))
 }
 
 #[tokio::test]
