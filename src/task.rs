@@ -19,7 +19,7 @@ impl<Output> TaskInterface<Output> {
     }
 
     /// Send the output to the pool via a channel, returns an error if the sender fail to handle the message
-    pub async fn output(self, output: Output) -> ForgeResult<OpId> {
+    pub async fn output(&self, output: Output) -> ForgeResult<OpId> {
         if self.output_sender.send((self.id, output)).await.is_err() {
             Err(ForgeError::FailedToOutput(self.id))
         } else {
