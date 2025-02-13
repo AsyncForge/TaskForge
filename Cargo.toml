@@ -1,6 +1,6 @@
 [package]
 name = "task_forge"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MIT"
 description = "A flexible and simple task pool for asynchronous execution"
