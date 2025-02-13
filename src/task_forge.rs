@@ -24,7 +24,7 @@ enum TaskState {
 }
 
 /// This struct represents the result of a completed task. It contains the output, the task ID, and a boolean indicating whether the output cleared the forge (true) or not (false).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ForgeTaskEnded<Output: Send> {
     pub output: Arc<Output>,
     pub id: OpId,
